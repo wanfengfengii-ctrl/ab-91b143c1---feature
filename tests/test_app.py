@@ -31,6 +31,25 @@ INFEASIBLE_PAYLOAD: Dict[str, Any] = {
     "residual_limit": 1,
 }
 
+MIXED_PAYLOAD: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [
+        15,
+        25,
+        35,
+        45,
+        {"min": 57, "max": 60},
+        {"min": 65, "max": 70},
+        {"min": 75, "max": 80},
+        {"min": 85, "max": 90},
+    ],
+    "drift_min": -5,
+    "drift_max": 5,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 1,
+}
+
 
 class AlignFromPayloadTests(unittest.TestCase):
     def test_feasible(self) -> None:
@@ -80,6 +99,72 @@ class AlignFromPayloadTests(unittest.TestCase):
         status, body = align_from_payload("not-a-dict")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_body")
+
+    def test_mixed_observations_feasible(self) -> None:
+        status, body = align_from_payload(MIXED_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["drift"], 5)
+        samples = {
+            s["index"]: s
+            for lv in body["levels"]
+            for s in lv["samples"]
+        }
+        # 电平 55 位于区间 [57,60] 左侧，见证取下界、残差 +2。
+        self.assertEqual(samples[4]["witness"], 57)
+        self.assertEqual(samples[4]["residual"], 2)
+        self.assertEqual(samples[5]["witness"], 65)
+        self.assertEqual(samples[6]["witness"], 75)
+        self.assertEqual(samples[7]["witness"], 85)
+        self.assertEqual(body["residual_sum"], 2)
+        # 证据覆盖。
+        covered = [
+            s["index"] for lv in body["levels"] for s in lv["samples"]
+        ]
+        self.assertEqual(covered, list(range(8)))
+
+    def test_inverted_interval_returns_field_error(self) -> None:
+        bad = json.loads(json.dumps(MIXED_PAYLOAD))
+        bad["observations"][-1] = {"min": 100, "max": 90}
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+        self.assertIn("倒置", body["message"])
+
+    def test_missing_interval_field_returns_field_error(self) -> None:
+        bad = json.loads(json.dumps(MIXED_PAYLOAD))
+        bad["observations"][-1] = {"min": 90}
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertIn("缺少字段", body["message"])
+
+    def test_too_many_intervals_returns_field_error(self) -> None:
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        bad = dict(FEASIBLE_PAYLOAD)
+        bad["reference_levels"] = ref
+        bad["observations"] = [
+            0,
+            {"min": 9, "max": 11},
+            {"min": 19, "max": 21},
+            {"min": 29, "max": 31},
+            {"min": 39, "max": 41},
+            {"min": 49, "max": 51},
+            {"min": 59, "max": 61},
+            {"min": 69, "max": 71},
+        ]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertIn("超过上限", body["message"])
+
+    def test_pure_integer_response_fields_unchanged(self) -> None:
+        status, body = align_from_payload(FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        for lv in body["levels"]:
+            for s in lv["samples"]:
+                self.assertEqual(
+                    set(s), {"index", "observed", "residual"}
+                )
 
 
 class HttpEndToEndTests(unittest.TestCase):

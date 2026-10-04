@@ -5,9 +5,35 @@ from __future__ import annotations
 import itertools
 import random
 import unittest
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from nanopore_align.alignment import AlignmentError, solve_alignment
+from nanopore_align.alignment import (
+    AlignmentError,
+    MAX_INTERVAL_OBSERVATIONS,
+    solve_alignment,
+)
+
+Obs = Union[int, Tuple[int, int]]
+
+
+def _distance(level: int, obs: Obs) -> int:
+    """采用电平到点观测或闭区间的最短整数距离。"""
+    if isinstance(obs, tuple):
+        lo, hi = obs
+        if level < lo:
+            return lo - level
+        if level > hi:
+            return level - hi
+        return 0
+    return abs(obs - level)
+
+
+def _witness(level: int, obs: Obs) -> Tuple[int, int]:
+    """返回 (最近见证值, 有符号残差)。"""
+    if isinstance(obs, tuple):
+        w = min(max(level, obs[0]), obs[1])
+        return w, w - level
+    return obs, obs - level
 
 
 def brute_force(
@@ -21,6 +47,29 @@ def brute_force(
     max_skips: int,
 ) -> Optional[dict]:
     """穷举所有漂移 / 含首尾子序列 / 停留组合，返回与 solve 同口径的最优解。"""
+    return _brute_force_mixed(
+        list(reference),
+        list(observations),
+        drift_min,
+        drift_max,
+        residual_limit,
+        dwell_min,
+        dwell_max,
+        max_skips,
+    )
+
+
+def _brute_force_mixed(
+    reference: Sequence[int],
+    observations: Sequence[Obs],
+    drift_min: int,
+    drift_max: int,
+    residual_limit: int,
+    dwell_min: int,
+    dwell_max: int,
+    max_skips: int,
+) -> Optional[dict]:
+    """混合观测版本的穷举：区间项残差按到闭区间的最短距离计。"""
     R = len(reference)
     N = len(observations)
     best: Optional[Tuple] = None
@@ -47,7 +96,7 @@ def brute_force(
                     for ri, L in zip(used, dwells):
                         level = reference[ri] + d
                         for t in range(s, s + L):
-                            r = abs(observations[t] - level)
+                            r = _distance(level, observations[t])
                             if r > residual_limit:
                                 ok = False
                                 break
@@ -76,10 +125,18 @@ def brute_force(
     }
 
 
+def _normalize_observations(observations: Sequence[Any]) -> List[Obs]:
+    """把 dict 形式的区间观测转换为算法内部使用的 (min, max) 元组。"""
+    return [
+        (o["min"], o["max"]) if isinstance(o, dict) else o
+        for o in observations
+    ]
+
+
 def _assert_matches_brute(
     testcase: unittest.TestCase,
     reference: Sequence[int],
-    observations: Sequence[int],
+    observations: Sequence[Any],
     drift_min: int,
     drift_max: int,
     residual_limit: int,
@@ -87,9 +144,15 @@ def _assert_matches_brute(
     dwell_max: int = 3,
     max_skips: int = 2,
 ) -> None:
+    norm_obs = _normalize_observations(observations)
+    # 对外接口的区间项是 min/max 对象：把元组形态转成 dict 再提交。
+    payload_obs: List[Any] = [
+        {"min": o[0], "max": o[1]} if isinstance(o, tuple) else o
+        for o in observations
+    ]
     got = solve_alignment(
         reference,
-        observations,
+        payload_obs,
         drift_min,
         drift_max,
         residual_limit,
@@ -97,9 +160,9 @@ def _assert_matches_brute(
         dwell_max,
         max_skips,
     )
-    want = brute_force(
+    want = _brute_force_mixed(
         reference,
-        observations,
+        norm_obs,
         drift_min,
         drift_max,
         residual_limit,
@@ -118,6 +181,44 @@ def _assert_matches_brute(
     testcase.assertEqual(got["boundaries"], want["boundaries"])
     got_used = [lv["reference_index"] for lv in got["levels"]]
     testcase.assertEqual(got_used, want["used_indices"])
+    _assert_evidence_consistent(testcase, reference, norm_obs, got)
+
+
+def _assert_evidence_consistent(
+    testcase: unittest.TestCase,
+    reference: Sequence[int],
+    observations: Sequence[Obs],
+    got: dict,
+) -> None:
+    """逐级证据覆盖全部采样，区间项见证值/残差可按规则复算。"""
+    covered: List[int] = []
+    total = 0
+    worst = 0
+    for lv in got["levels"]:
+        adopted = lv["adopted_level"]
+        testcase.assertEqual(
+            adopted, reference[lv["reference_index"]] + got["drift"]
+        )
+        for s in lv["samples"]:
+            t = s["index"]
+            covered.append(t)
+            obs = observations[t]
+            w, r = _witness(adopted, obs)
+            if isinstance(obs, tuple):
+                testcase.assertEqual(s["observed_min"], obs[0])
+                testcase.assertEqual(s["observed_max"], obs[1])
+                testcase.assertEqual(s["witness"], w)
+                testcase.assertNotIn("observed", s)
+            else:
+                testcase.assertEqual(s["observed"], obs)
+                testcase.assertNotIn("witness", s)
+            testcase.assertEqual(s["residual"], r)
+            testcase.assertEqual(abs(r), _distance(adopted, obs))
+            total += abs(r)
+            worst = max(worst, abs(r))
+    testcase.assertEqual(covered, list(range(len(observations))))
+    testcase.assertEqual(total, got["residual_sum"])
+    testcase.assertEqual(worst, got["max_abs_residual"])
 
 
 class ExactAlignmentTests(unittest.TestCase):
@@ -365,6 +466,205 @@ class ValidationTests(unittest.TestCase):
         kw["reference"] = []  # type: ignore[assignment]
         with self.assertRaises(AlignmentError):
             solve_alignment(**kw)
+
+
+class IntervalObservationTests(unittest.TestCase):
+    """区间（部分采样整数闭区间）观测的语义测试。"""
+
+    def test_interval_pins_drift_and_returns_witness(self) -> None:
+        # 与 verify 混合用例同构：点观测把漂移限到 [3,5]，
+        # 区间 [57,60] 仅在 d=5 时距离 2 不越限。
+        ref = [10, 20, 30, 40, 50, 60, 70, 80]
+        obs: List[Any] = [
+            15, 25, 35, 45,
+            {"min": 57, "max": 60},
+            {"min": 65, "max": 70},
+            {"min": 75, "max": 80},
+            {"min": 85, "max": 90},
+        ]
+        res = solve_alignment(ref, obs, -5, 5, 2, dwell_min=1, dwell_max=1)
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["drift"], 5)
+        samples = {
+            s["index"]: s
+            for lv in res["levels"]
+            for s in lv["samples"]
+        }
+        # 电平 55 在区间 [57,60] 左侧：最近见证为下界 57，残差 +2。
+        self.assertEqual(samples[4]["witness"], 57)
+        self.assertEqual(samples[4]["residual"], 2)
+        # 电平 65/75/85 落在各自区间内部：见证即采用电平，残差 0。
+        self.assertEqual(samples[5]["witness"], 65)
+        self.assertEqual(samples[5]["residual"], 0)
+        self.assertEqual(samples[6]["witness"], 75)
+        self.assertEqual(samples[7]["witness"], 85)
+        self.assertEqual(res["residual_sum"], 2)
+        self.assertEqual(res["max_abs_residual"], 2)
+
+    def test_interval_above_level_clamps_to_max(self) -> None:
+        # 采用电平高于区间上界：见证取上界，残差为负。
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        obs: List[Any] = [
+            0, 10, 20, 30, 40, 50, 60, {"min": 60, "max": 65}
+        ]
+        res = solve_alignment(ref, obs, 0, 0, 5, dwell_min=1, dwell_max=1)
+        self.assertTrue(res["feasible"])
+        last = res["levels"][-1]["samples"][0]
+        self.assertEqual(last["witness"], 65)
+        self.assertEqual(last["residual"], -5)
+        self.assertEqual(res["residual_sum"], 5)
+
+    def test_interval_distance_must_obey_residual_limit(self) -> None:
+        # 点观测全部精确匹配 d=0，但区间 [76,80] 距电平 70 为 6 > 2：
+        # 区间残差参与上限裁决，故无解（而不是被中点误放进来）。
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        obs: List[Any] = [
+            0, 10, 20, 30, 40, 50, 60, {"min": 76, "max": 80}
+        ]
+        res = solve_alignment(ref, obs, 0, 0, 2, dwell_min=1, dwell_max=1)
+        self.assertFalse(res["feasible"])
+        self.assertEqual(res["reason"], "no_alignment_exists")
+        # 放宽上限后可行。
+        res2 = solve_alignment(ref, obs, 0, 0, 6, dwell_min=1, dwell_max=1)
+        self.assertTrue(res2["feasible"])
+        self.assertEqual(res2["residual_sum"], 6)
+
+    def test_degenerate_interval_equals_point(self) -> None:
+        # min == max 的退化区间等价于该整数点观测。
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        obs_deg = [0, 10, 20, 30, 40, 50, 60, {"min": 72, "max": 72}]
+        obs_pt = [0, 10, 20, 30, 40, 50, 60, 72]
+        a = solve_alignment(ref, obs_deg, -5, 5, 3, dwell_min=1, dwell_max=1)
+        b = solve_alignment(ref, obs_pt, -5, 5, 3, dwell_min=1, dwell_max=1)
+        self.assertTrue(a["feasible"] and b["feasible"])
+        self.assertEqual(a["drift"], b["drift"])
+        self.assertEqual(a["residual_sum"], b["residual_sum"])
+        self.assertEqual(a["boundaries"], b["boundaries"])
+
+    def test_no_midpoint_substitution_changes_boundaries(self) -> None:
+        # 关键语义：不得先把区间替换成中点。区间 [4,8] 的中点是 6，
+        # 若错误地使用中点，电平 5（d=5）的残差会是 -1；
+        # 正确的最短距离为 0（电平落在区间内）。
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        obs: List[Any] = [
+            5, 15, 25, 35, 45, {"min": 51, "max": 59}, 65, 75
+        ]
+        res = solve_alignment(ref, obs, 0, 10, 0, dwell_min=1, dwell_max=1)
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["drift"], 5)
+        self.assertEqual(res["residual_sum"], 0)
+        s5 = res["levels"][5]["samples"][0]
+        self.assertEqual(s5["witness"], 55)
+        self.assertEqual(s5["residual"], 0)
+
+    def test_inverted_interval_rejected(self) -> None:
+        ref = list(range(8))
+        obs: List[Any] = [0, 1, 2, 3, 4, 5, 6, {"min": 9, "max": 7}]
+        with self.assertRaises(AlignmentError) as ctx:
+            solve_alignment(ref, obs, 0, 0, 1)
+        self.assertIn("倒置", str(ctx.exception))
+
+    def test_missing_interval_field_rejected(self) -> None:
+        ref = list(range(8))
+        obs: List[Any] = [0, 1, 2, 3, 4, 5, 6, {"min": 7}]
+        with self.assertRaises(AlignmentError) as ctx:
+            solve_alignment(ref, obs, 0, 0, 1)
+        self.assertIn("缺少字段", str(ctx.exception))
+
+    def test_too_many_intervals_rejected(self) -> None:
+        ref = list(range(8))
+        obs: List[Any] = [
+            0,
+            *[{"min": i, "max": i + 1} for i in range(1, 8)],
+        ]
+        self.assertEqual(
+            sum(isinstance(o, dict) for o in obs),
+            MAX_INTERVAL_OBSERVATIONS + 1,
+        )
+        with self.assertRaises(AlignmentError) as ctx:
+            solve_alignment(ref, obs, 0, 0, 1)
+        self.assertIn("超过上限", str(ctx.exception))
+
+    def test_interval_field_types_rejected(self) -> None:
+        ref = list(range(8))
+        bad_obs: List[Any] = [0, 1, 2, 3, 4, 5, 6, {"min": "7", "max": 8}]
+        with self.assertRaises(AlignmentError):
+            solve_alignment(ref, bad_obs, 0, 0, 1)
+        bad_obs2: List[Any] = [0, 1, 2, 3, 4, 5, 6, {"min": 7, "max": True}]
+        with self.assertRaises(AlignmentError):
+            solve_alignment(ref, bad_obs2, 0, 0, 1)
+
+    def test_exactly_six_intervals_allowed(self) -> None:
+        ref = [0, 10, 20, 30, 40, 50, 60, 70]
+        obs: List[Any] = [
+            0, 10,
+            {"min": 19, "max": 21},
+            {"min": 29, "max": 31},
+            {"min": 39, "max": 41},
+            {"min": 49, "max": 51},
+            {"min": 59, "max": 61},
+            {"min": 69, "max": 71},
+        ]
+        res = solve_alignment(ref, obs, 0, 0, 1, dwell_min=1, dwell_max=1)
+        self.assertTrue(res["feasible"])
+
+
+class MixedBruteForceComparisonTests(unittest.TestCase):
+    """随机混合（点 + 区间）小规模实例：DP 必须与穷举完全一致。"""
+
+    def test_random_mixed_cases(self) -> None:
+        rng = random.Random(20261005)
+        for trial in range(150):
+            R = rng.randint(8, 10)
+            N = rng.randint(8, 14)
+            ref = [rng.randint(0, 40) for _ in range(R)]
+            used = [0]
+            inner = list(range(1, R - 1))
+            rng.shuffle(inner)
+            skip_k = rng.randint(0, min(2, R - 2))
+            skipped_set = set(inner[:skip_k])
+            used = [i for i in range(R) if i not in skipped_set]
+            k = len(used)
+            if k > N:
+                used = list(range(R))
+                k = R
+                skipped_set = set()
+            dwells = self._random_composition(rng, k, N, 1, 3)
+            if dwells is None:
+                continue
+            d = rng.randint(-3, 3)
+            obs: List[Obs] = []
+            for ri, L in zip(used, dwells):
+                level = ref[ri] + d
+                for _ in range(L):
+                    noise = rng.choice([0, 0, 1, -1, 2, -2, 5])
+                    center = level + noise
+                    if rng.random() < 0.4:
+                        half = rng.randint(0, 3)
+                        obs.append((center - half, center + rng.randint(0, 3)))
+                    else:
+                        obs.append(center)
+            if sum(isinstance(o, tuple) for o in obs) > 6:
+                continue
+            limit = rng.choice([0, 1, 2, 3, 10])
+            d_lo = d - rng.randint(0, 3)
+            d_hi = d + rng.randint(0, 3)
+            with self.subTest(trial=trial):
+                _assert_matches_brute(
+                    self, ref, obs, d_lo, d_hi, limit, 1, 3, 2
+                )
+
+    @staticmethod
+    def _random_composition(
+        rng: random.Random, k: int, n: int, lo: int, hi: int
+    ) -> Optional[List[int]]:
+        if not k * lo <= n <= k * hi:
+            return None
+        for _ in range(500):
+            parts = [rng.randint(lo, hi) for _ in range(k)]
+            if sum(parts) == n:
+                return parts
+        return None
 
 
 class ResidualEvidenceTests(unittest.TestCase):

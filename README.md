@@ -22,11 +22,26 @@
 | 字段 | 类型 | 约束 |
 | --- | --- | --- |
 | `reference_levels` | int[] | 8–24 个整数参考电平 |
-| `observations` | int[] | 8–60 个整数观测 |
+| `observations` | array | 8–60 项；整数或含整数 `min`、`max` 的闭区间对象，区间项最多 6 个 |
 | `drift_min` / `drift_max` | int | 统一漂移闭区间，宽度 ≤ 2000 |
-| `residual_limit` | int | 残差上限（非负） |
+| `residual_limit` | int | 残差上限（非负；区间项按到闭区间的最短距离计） |
 | `dwell_min` / `dwell_max` | int，可选 | 每级停留采样范围，默认 1–3（1 ≤ … ≤ 3） |
 | `max_skips` | int，可选 | 内部跳过上限，默认 2（0–2） |
+
+量程切换或低信噪阶段只能给出**部分采样**的整数电流闭区间时，
+直接提交区间对象即可，无需先取中点（取中点会引入与真实漂移无关的
+系统偏移，改变漂移选择与停留边界）：
+
+```json
+"observations": [15, 25, 35, 45, {"min": 57, "max": 60},
+                 {"min": 65, "max": 70}, {"min": 75, "max": 80},
+                 {"min": 85, "max": 90}]
+```
+
+对采用电平 `L`，区间项 `[a,b]` 的残差取该电平到闭区间的**最短整数
+距离**：`a-L`（L<a）、`L-b`（L>b）、`0`（a≤L≤b）；该距离同样受
+`residual_limit` 约束并参与五级裁决。全部观测为整数时，请求、裁决、
+响应与失败语义与旧版完全一致。
 
 成功（HTTP 200）返回：
 
@@ -57,6 +72,10 @@
 
 * `boundaries`：内部连续采样边界（不含 0 与末尾 N）；
 * `levels[].samples[]`：逐级残差证据，覆盖每个观测恰好一次。
+  点观测样本为 `{"index", "observed", "residual"}`；区间观测样本为
+  `{"index", "observed_min", "observed_max", "witness", "residual"}`，
+  其中 `witness` 是区间内距采用电平最近的整数，`residual` 为
+  有符号残差 `witness - adopted_level`（绝对值即最短距离）。
 
 任何合法对齐都不存在时仍返回 HTTP 200，但给出明确无解结论：
 
@@ -81,7 +100,7 @@ python verify/verify.py
 # 构建并启动带健康检查的 API（宿主机端口可配置）
 NANOPORE_HOST_PORT=9090 docker compose up -d --build api
 
-# 一次性验证服务：包构建 → 代码测试 → 可行/无解/非法 HTTP 冒烟
+# 一次性验证服务：包构建 → 代码测试 → 混合观测可行/无解/非法区间/纯整数兼容 HTTP 冒烟
 # 以退出码汇报（0 全部通过）
 docker compose up --build verify
 ```
@@ -91,6 +110,8 @@ docker compose up --build verify
 见 `nanopore_align/alignment.py` 模块文档字符串。要点：逐整数漂移做
 动态规划，`grid[j][i]` 为观测前缀在参考电平 `R[i]` 结束时的最优代价；
 首级强制为 `R[0]`、末级强制为 `R[R-1]`；采样块的可行漂移区间
-`[max(O−R) − lim, min(O−R) + lim]` 与漂移无关、一次性预计算，
-并以首末级可行区间交集预筛漂移；边界序列以 64 为基编码为整数，
+点项为 `[O−R−lim, O−R+lim]`、区间项 `[a,b]` 为
+`[a−R−lim, b−R+lim]`，块内取交集后与漂移无关、一次性预计算，
+并以首末级可行区间交集预筛漂移；残差统计对区间项取到闭区间的最短
+整数距离；边界序列以 64 为基编码为整数，
 字典序平局裁决即整数比较。
