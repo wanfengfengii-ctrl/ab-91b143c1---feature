@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanopore-current-trace-alignment"
+version = "1.0.0"
+description = "Joint alignment of nanopore ion-current observations to integer reference levels"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Nanopore QC Team" }]
+keywords = ["nanopore", "alignment", "dynamic-programming", "current-trace"]
+dependencies = []
+
+[project.scripts]
+nanopore-align-api = "nanopore_align.app:main"
+
+[tool.setuptools]
+packages = ["nanopore_align"]

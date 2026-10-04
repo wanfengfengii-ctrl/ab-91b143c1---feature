@@ -1,0 +1,2 @@
+[console_scripts]
+nanopore-align-api = nanopore_align.app:main

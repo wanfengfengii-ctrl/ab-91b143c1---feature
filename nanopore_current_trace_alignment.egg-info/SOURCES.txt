@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+nanopore_align/__init__.py
+nanopore_align/alignment.py
+nanopore_align/app.py
+nanopore_current_trace_alignment.egg-info/PKG-INFO
+nanopore_current_trace_alignment.egg-info/SOURCES.txt
+nanopore_current_trace_alignment.egg-info/dependency_links.txt
+nanopore_current_trace_alignment.egg-info/entry_points.txt
+nanopore_current_trace_alignment.egg-info/top_level.txt
