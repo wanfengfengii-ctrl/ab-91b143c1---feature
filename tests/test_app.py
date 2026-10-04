@@ -31,6 +31,27 @@ INFEASIBLE_PAYLOAD: Dict[str, Any] = {
     "residual_limit": 1,
 }
 
+# 混合观测（整数 + min/max 区间）可行负载：唯一解 drift=0，
+# 残差和 10、最大残差 2；区间见证 (index=1 -> 20/+0, index=4 -> 51/+1)。
+MIXED_FEASIBLE_PAYLOAD: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [
+        12,
+        {"min": 18, "max": 21},
+        31,
+        38,
+        {"min": 51, "max": 54},
+        58,
+        71,
+        79,
+    ],
+    "drift_min": -5,
+    "drift_max": 5,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 1,
+}
+
 
 class AlignFromPayloadTests(unittest.TestCase):
     def test_feasible(self) -> None:
@@ -80,6 +101,64 @@ class AlignFromPayloadTests(unittest.TestCase):
         status, body = align_from_payload("not-a-dict")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_body")
+
+
+class MixedObservationPayloadTests(unittest.TestCase):
+    """混合观测（整数 + min/max 区间）的请求校验与响应形状。"""
+
+    def test_mixed_feasible(self) -> None:
+        status, body = align_from_payload(MIXED_FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["drift"], 0)
+        self.assertEqual(body["residual_sum"], 10)
+        self.assertEqual(body["max_abs_residual"], 2)
+        self.assertEqual(
+            body["interval_witnesses"],
+            [
+                {"index": 1, "min": 18, "max": 21, "witness": 20, "residual": 0},
+                {"index": 4, "min": 51, "max": 54, "witness": 51, "residual": 1},
+            ],
+        )
+        covered = [s["index"] for lv in body["levels"] for s in lv["samples"]]
+        self.assertEqual(covered, list(range(8)))
+
+    def test_inverted_interval_rejected_with_field(self) -> None:
+        bad = json.loads(json.dumps(MIXED_FEASIBLE_PAYLOAD))
+        bad["observations"][1] = {"min": 22, "max": 18}
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(body["field"], "observations[1]")
+        self.assertIn("倒置", body["message"])
+
+    def test_missing_interval_field_rejected_with_field(self) -> None:
+        bad = json.loads(json.dumps(MIXED_FEASIBLE_PAYLOAD))
+        bad["observations"][1] = {"min": 19}
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(body["field"], "observations[1]")
+
+    def test_too_many_intervals_rejected_with_field(self) -> None:
+        bad = dict(MIXED_FEASIBLE_PAYLOAD)
+        bad["observations"] = [
+            {"min": v, "max": v}
+            for v in (12, 19, 31, 38, 52, 58, 71)
+        ] + [79]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(body["field"], "observations")
+
+    def test_pure_integer_response_has_no_interval_fields(self) -> None:
+        status, body = align_from_payload(FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertNotIn("interval_witnesses", body)
+        for lv in body["levels"]:
+            for s in lv["samples"]:
+                self.assertEqual(set(s), {"index", "observed", "residual"})
 
 
 class HttpEndToEndTests(unittest.TestCase):
@@ -136,6 +215,27 @@ class HttpEndToEndTests(unittest.TestCase):
         status, body = self._post(INFEASIBLE_PAYLOAD)
         self.assertEqual(status, 200)
         self.assertFalse(body["feasible"])
+
+    def test_mixed_observations_roundtrip(self) -> None:
+        status, body = self._post(MIXED_FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["drift"], 0)
+        self.assertEqual(len(body["interval_witnesses"]), 2)
+        covered = [
+            s["index"]
+            for lv in body["levels"]
+            for s in lv["samples"]
+        ]
+        self.assertEqual(covered, list(range(8)))
+
+    def test_invalid_interval_roundtrip(self) -> None:
+        bad = json.loads(json.dumps(MIXED_FEASIBLE_PAYLOAD))
+        bad["observations"][4] = {"min": 55, "max": 51}
+        status, body = self._post(bad)
+        self.assertEqual(status, 400)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["field"], "observations[4]")
 
     def test_invalid_roundtrip(self) -> None:
         bad = dict(FEASIBLE_PAYLOAD)

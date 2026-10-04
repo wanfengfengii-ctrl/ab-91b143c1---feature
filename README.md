@@ -22,11 +22,16 @@
 | 字段 | 类型 | 约束 |
 | --- | --- | --- |
 | `reference_levels` | int[] | 8–24 个整数参考电平 |
-| `observations` | int[] | 8–60 个整数观测 |
+| `observations` | (int \| {"min","max"})[] | 8–60 项；整数为精确采样，`{"min","max"}` 为量程切换/低信噪阶段的整数闭区间（`min ≤ max`），区间项最多 6 个 |
 | `drift_min` / `drift_max` | int | 统一漂移闭区间，宽度 ≤ 2000 |
 | `residual_limit` | int | 残差上限（非负） |
 | `dwell_min` / `dwell_max` | int，可选 | 每级停留采样范围，默认 1–3（1 ≤ … ≤ 3） |
 | `max_skips` | int，可选 | 内部跳过上限，默认 2（0–2） |
+
+区间观测的残差取**采用电平到闭区间的最短整数距离**（电平落在区间内
+为 0，否则为到最近端点的距离），该距离同样不得超过 `residual_limit`，
+并参与既有五级裁决（跳过数 → 残差和 → 最大残差 → 漂移 → 边界字典序）。
+纯整数请求的裁决、响应与失败语义与历史版本完全一致。
 
 成功（HTTP 200）返回：
 
@@ -56,7 +61,12 @@
 ```
 
 * `boundaries`：内部连续采样边界（不含 0 与末尾 N）；
-* `levels[].samples[]`：逐级残差证据，覆盖每个观测恰好一次。
+* `levels[].samples[]`：逐级残差证据，覆盖每个观测恰好一次；区间观测
+  样本额外给出 `witness`（区间内离采用电平最近的整数）与有符号
+  `residual = witness - adopted_level`；
+* `interval_witnesses`：仅当观测含区间项时返回，按采样下标汇总每个
+  区间项的 `min`/`max`/`witness`/`residual`，可据此按区间距离规则
+  复算 `residual_sum` 与 `max_abs_residual`。
 
 任何合法对齐都不存在时仍返回 HTTP 200，但给出明确无解结论：
 
@@ -64,7 +74,9 @@
 {"feasible": false, "reason": "no_alignment_exists", "message": "..."}
 ```
 
-字段越界或序列规模非法返回 HTTP 400 与错误原因；另有
+字段越界或序列规模非法返回 HTTP 400 与错误原因；区间倒置
+（`min > max`）、区间对象字段缺失或区间项数量超限同样返回 HTTP 400，
+并附带 `field` 字段定位（如 `"observations[2]"`）。另有
 `GET /health` 健康检查。
 
 ## 本地运行（无需容器）
@@ -81,8 +93,8 @@ python verify/verify.py
 # 构建并启动带健康检查的 API（宿主机端口可配置）
 NANOPORE_HOST_PORT=9090 docker compose up -d --build api
 
-# 一次性验证服务：包构建 → 代码测试 → 可行/无解/非法 HTTP 冒烟
-# 以退出码汇报（0 全部通过）
+# 一次性验证服务：包构建 → 代码测试 → HTTP 冒烟
+# （混合观测可行 / 混合无解 / 非法区间 / 纯整数兼容），以退出码汇报（0 全部通过）
 docker compose up --build verify
 ```
 

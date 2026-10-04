@@ -74,7 +74,11 @@ def align_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     try:
         result = solve_alignment(**kwargs)
     except AlignmentError as exc:
-        return _bad_request("invalid_request", str(exc))
+        status, body = _bad_request("invalid_request", str(exc))
+        if exc.field:
+            # 明确字段错误（如区间倒置、字段缺失、区间项数量超限）。
+            body["field"] = exc.field
+        return status, body
     except TypeError as exc:
         return _bad_request("invalid_request", f"字段类型错误: {exc}")
 
